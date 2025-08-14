@@ -20,3 +20,9 @@ CHAT_ID = "你的Telegram Chat ID"
 BINANCE_API_KEY = "你的Binance API Key"
 
 BINANCE_API_SECRET = "你的Binance API Secret"
+
+**启动**
+```bash
+python3 ma_bot.py
+```
+在你的TG_BOT中发送/start,根据提示进行设置。

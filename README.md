@@ -17,7 +17,7 @@ sudo apt install ntpdate
 sudo ntpdate pool.ntp.org
 ```
 
-**配置文件修改**
+**配置文件`config.py`修改**
 
 TOKEN = "你的Telegram Bot Token"
 

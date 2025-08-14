@@ -8,7 +8,7 @@ cd Ma_Trade_BOT
 
 **安装依赖**
 ```bash
-pip install python-telegram-bot==13.7 aiohttp
+pip3 install python-telegram-bot==13.7 aiohttp #或者 pip install python-telegram-bot==13.7 aiohttp
 ```
 
 **安装时间同步**
@@ -29,6 +29,6 @@ BINANCE_API_SECRET = "你的Binance API Secret"
 
 **启动**
 ```bash
-python3 ma_bot.py
+python3 ma_bot.py #或者 python ma_bot.py
 ```
 在你的TG_BOT中发送/start,根据提示进行设置。

@@ -213,19 +213,28 @@ async def get_position(symbol):
                 }
     return None
 
-# --- 交易功能 ---
-async def set_leverage(symbol, leverage):
-    return await binance_request("POST", "/fapi/v1/leverage", 
-                               {"symbol": symbol, "leverage": leverage}, True)
+# --- 设置持仓模式 ---
+async def set_position_mode(dual=False):
+    """设置持仓模式 (dual: True=双向, False=单向)"""
+    params = {
+        "dualSidePosition": "true" if dual else "false"
+    }
+    return await binance_request("POST", "/fapi/v1/positionSide/dual", params, True)
 
-async def place_market_order(symbol, side, quantity):
+# --- 交易功能（优化为直接以金额下单）---
+async def place_market_order_by_value(symbol, side, quote_quantity):
+    """直接以报价货币金额下单（如USDT）"""
     params = {
         "symbol": symbol,
         "side": side,
         "type": "MARKET",
-        "quantity": round(quantity, 3)
+        "quoteOrderQty": quote_quantity  # 以报价货币计价的金额
     }
     return await binance_request("POST", "/fapi/v1/order", params, True)
+
+async def set_leverage(symbol, leverage):
+    return await binance_request("POST", "/fapi/v1/leverage", 
+                               {"symbol": symbol, "leverage": leverage}, True)
 
 async def place_oco_order(symbol, side, quantity, entry_price, take_profit, stop_loss):
     if take_profit <= 0 and stop_loss <= 0:
@@ -243,7 +252,7 @@ async def place_oco_order(symbol, side, quantity, entry_price, take_profit, stop
     params = {
         "symbol": symbol,
         "side": oco_side,
-        "quantity": round(quantity, 3),
+        "quantity": quantity,
         "price": round(take_profit_price, 4),
         "stopPrice": round(stop_loss_price, 4),
         "stopLimitPrice": round(stop_loss_price, 4),
@@ -290,11 +299,11 @@ async def monitor_task(app):
                         prev_ma9, prev_ma26 = prev_states[symbol_key]
                         
                         # 信号检测
+                        signal_detected = False
                         if prev_ma9 <= prev_ma26 and ma9 > ma26:
                             signal_msg = f"📈 检测到买入信号 {symbol}\n价格: {price:.4f}"
                             print(signal_msg)
-                            for uid in user_states.keys():
-                                await app.bot.send_message(chat_id=uid, text=signal_msg)
+                            signal_detected = True
                             
                             if item["type"] == "contract" and trade_settings["auto_trade"]:
                                 if await execute_trade(app, symbol, "BUY"):
@@ -303,12 +312,16 @@ async def monitor_task(app):
                         elif prev_ma9 >= prev_ma26 and ma9 < ma26:
                             signal_msg = f"📉 检测到卖出信号 {symbol}\n价格: {price:.4f}"
                             print(signal_msg)
-                            for uid in user_states.keys():
-                                await app.bot.send_message(chat_id=uid, text=signal_msg)
+                            signal_detected = True
                             
                             if item["type"] == "contract" and trade_settings["auto_trade"]:
                                 if await execute_trade(app, symbol, "SELL"):
                                     pass
+                        
+                        # 推送信号
+                        if signal_detected:
+                            for uid in user_states.keys():
+                                await app.bot.send_message(chat_id=uid, text=signal_msg)
                     
                     prev_states[symbol_key] = (ma9, ma26)
                     
@@ -360,12 +373,20 @@ async def check_tp_sl(app, symbol, pos, price):
                 await app.bot.send_message(chat_id=uid, text=f"📉 检测到{symbol}止损触发")
             await close_position(app, symbol, "stop_loss", price, is_existing=(symbol in existing_positions))
 
-# --- execute_trade 函数（已修复名义价值问题）---
+# --- execute_trade 函数（使用金额下单）---
 async def execute_trade(app, symbol, signal_type):
     if not trade_settings["auto_trade"]:
         return False
     
     try:
+        # 设置持仓模式为单向
+        position_mode_res = await set_position_mode(False)
+        if position_mode_res and position_mode_res.get("code") != 200:
+            print(f"设置持仓模式失败: {position_mode_res}")
+            for uid in user_states.keys():
+                await app.bot.send_message(chat_id=uid, text=f"❌ {symbol} 设置持仓模式失败，请手动设置为单向持仓模式")
+            return False
+        
         # 获取设置
         leverage = trade_settings["global_leverage"]
         notional_value = trade_settings["global_order_amount"]  # 用户设置的名义价值
@@ -388,22 +409,6 @@ async def execute_trade(app, symbol, signal_type):
                 await app.bot.send_message(chat_id=uid, text=f"❌ {symbol} 设置杠杆失败")
             return False
         
-        # 获取K线数据
-        klines = await get_klines(symbol, "contract")
-        if not klines:
-            for uid in user_states.keys():
-                await app.bot.send_message(chat_id=uid, text=f"❌ {symbol} 获取K线失败")
-            return False
-            
-        price = float(klines[-1][4])
-        
-        # 计算保证金
-        margin = notional_value / leverage
-        
-        # 计算数量
-        quantity = notional_value / price
-        quantity = round(quantity, 3)  # 四舍五入到3位小数
-        
         # 处理反向持仓
         if signal_type == "BUY":
             pos = await get_position(symbol)
@@ -415,7 +420,8 @@ async def execute_trade(app, symbol, signal_type):
             for uid in user_states.keys():
                 await app.bot.send_message(chat_id=uid, text=f"🚀 正在开多仓 {symbol}...")
                 
-            order = await place_market_order(symbol, "BUY", quantity)
+            # 直接以金额下单
+            order = await place_market_order_by_value(symbol, "BUY", notional_value)
             
         elif signal_type == "SELL":
             pos = await get_position(symbol)
@@ -427,14 +433,26 @@ async def execute_trade(app, symbol, signal_type):
             for uid in user_states.keys():
                 await app.bot.send_message(chat_id=uid, text=f"🚀 正在开空仓 {symbol}...")
                 
-            order = await place_market_order(symbol, "SELL", quantity)
+            # 直接以金额下单
+            order = await place_market_order_by_value(symbol, "SELL", notional_value)
         
         # 处理订单结果
         if order:
-            entry_price = float(order.get('price', price))
+            # 从订单响应中获取实际成交数量和价格
+            executed_qty = float(order.get('executedQty', 0))
+            cum_quote_qty = float(order.get('cummulativeQuoteQty', 0))
+            
+            # 计算平均成交价格
+            if executed_qty > 0:
+                entry_price = cum_quote_qty / executed_qty
+            else:
+                # 如果订单响应中没有数量信息，使用K线价格作为后备
+                klines = await get_klines(symbol, "contract")
+                entry_price = float(klines[-1][4]) if klines else 0
+            
             positions[symbol] = {
                 "side": "LONG" if signal_type == "BUY" else "SHORT",
-                "qty": quantity,
+                "qty": executed_qty,
                 "entry_price": entry_price,
                 "system_order": True  # 标记为本系统订单
             }
@@ -443,10 +461,9 @@ async def execute_trade(app, symbol, signal_type):
             pos_type = "多仓" if signal_type == "BUY" else "空仓"
             msg = f"✅ 开仓成功 {symbol} {pos_type}\n" \
                   f"价格: {entry_price:.4f}\n" \
-                  f"数量: {quantity:.4f}\n" \
-                  f"杠杆: {leverage}x\n" \
-                  f"名义价值: {notional_value:.2f} USDT\n" \
-                  f"保证金: {margin:.2f} USDT"
+                  f"数量: {executed_qty:.4f}\n" \
+                  f"金额: {cum_quote_qty:.2f} USDT\n" \
+                  f"杠杆: {leverage}x"
             for uid in user_states.keys():
                 await app.bot.send_message(chat_id=uid, text=msg)
             
@@ -455,7 +472,7 @@ async def execute_trade(app, symbol, signal_type):
                 oco_order = await place_oco_order(
                     symbol, 
                     signal_type, 
-                    quantity, 
+                    executed_qty,  # 使用实际成交数量
                     entry_price, 
                     trade_settings["take_profit"], 
                     trade_settings["stop_loss"]
@@ -489,7 +506,7 @@ async def close_position(app, symbol, close_type="signal", close_price=None, is_
         
         # 执行平仓
         side = "SELL" if pos["side"] == "LONG" else "BUY"
-        result = await place_market_order(symbol, side, pos["qty"])
+        result = await place_market_order_by_value(symbol, side, pos["qty"] * pos["entry_price"])
         
         if not result:
             for uid in user_states.keys():
@@ -661,7 +678,16 @@ async def handle_auto_trade(update, context, enable):
             )
             return
         
-        # 直接显示设置选项，不再询问
+        # 设置持仓模式为单向
+        position_mode_res = await set_position_mode(False)
+        if position_mode_res and position_mode_res.get("code") != 200:
+            await update.message.reply_text(
+                "❌ 设置持仓模式失败，请手动设置为单向持仓模式",
+                reply_markup=reply_markup_main
+            )
+            return
+        
+        # 询问设置方式
         keyboard = [
             [
                 InlineKeyboardButton("全局设置", callback_data="auto_trade_setting:global"),
@@ -669,7 +695,7 @@ async def handle_auto_trade(update, context, enable):
             ]
         ]
         await update.message.reply_text(
-            "✅ API验证成功",
+            "✅ API验证成功，持仓模式已设置为单向",
             reply_markup=InlineKeyboardMarkup(keyboard))
     else:
         trade_settings["auto_trade"] = False
@@ -919,6 +945,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 确认交易设置
     elif data_parts[0] == "confirm_trade":
         if data_parts[1] == "yes":
+            # 开启自动交易标志
+            trade_settings["auto_trade"] = True
+            save_trade_settings(trade_settings)
+            
             # 先检查非系统订单
             existing_positions_info = await check_existing_positions(app, user_id)
             
@@ -928,9 +958,7 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     existing_positions_info["message"],
                     reply_markup=InlineKeyboardMarkup(existing_positions_info["keyboard"]))
             else:
-                # 没有非系统订单，直接开启自动交易
-                trade_settings["auto_trade"] = True
-                save_trade_settings(trade_settings)
+                # 没有非系统订单，直接显示自动交易设置
                 await show_auto_trade_settings(app, user_id)
         else:
             user_states[user_id] = {}
@@ -950,7 +978,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         if float(pos["positionAmt"]) != 0:
                             symbol = pos["symbol"]
                             side = "SELL" if float(pos["positionAmt"]) > 0 else "BUY"
-                            await place_market_order(symbol, side, abs(float(pos["positionAmt"])))
+                            # 计算平仓金额（数量 × 标记价）
+                            mark_price = float(pos["markPrice"])
+                            quantity = abs(float(pos["positionAmt"]))
+                            quote_quantity = quantity * mark_price
+                            await place_market_order_by_value(symbol, side, quote_quantity)
                 
                 await query.edit_message_text("所有持仓已清空")
             except Exception as e:
@@ -972,7 +1004,11 @@ async def close_all_positions(query, context):
                 if float(pos["positionAmt"]) != 0:
                     symbol = pos["symbol"]
                     side = "SELL" if float(pos["positionAmt"]) > 0 else "BUY"
-                    await place_market_order(symbol, side, abs(float(pos["positionAmt"])))
+                    # 计算平仓金额（数量 × 标记价）
+                    mark_price = float(pos["markPrice"])
+                    quantity = abs(float(pos["positionAmt"]))
+                    quote_quantity = quantity * mark_price
+                    await place_market_order_by_value(symbol, side, quote_quantity)
         
         await query.edit_message_text("所有持仓已清空")
         await app.bot.send_message(user_id, "请使用下方菜单继续操作：", reply_markup=reply_markup_main)
